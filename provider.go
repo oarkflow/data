@@ -20,9 +20,9 @@ import (
 	"github.com/oarkflow/squealx/drivers/mysql"
 	"github.com/oarkflow/squealx/drivers/postgres"
 	"github.com/oarkflow/squealx/drivers/sqlite"
-
-	"github.com/oarkflow/data/utils"
 )
+
+type Record = map[string]any
 
 type Field struct {
 	Name      string
@@ -33,17 +33,17 @@ type Field struct {
 
 type Provider interface {
 	Setup(ctx context.Context) error
-	Create(ctx context.Context, item utils.Record) error
-	Read(ctx context.Context, id string) (utils.Record, error)
-	Update(ctx context.Context, item utils.Record) error
+	Create(ctx context.Context, item Record) error
+	Read(ctx context.Context, id string) (Record, error)
+	Update(ctx context.Context, item Record) error
 	Delete(ctx context.Context, id string) error
-	All(ctx context.Context) ([]utils.Record, error)
+	All(ctx context.Context) ([]Record, error)
 	Close() error
 }
 
 type StreamingProvider interface {
 	Provider
-	Stream(ctx context.Context) (<-chan utils.Record, <-chan error)
+	Stream(ctx context.Context) (<-chan Record, <-chan error)
 }
 
 type ProviderConfig struct {
@@ -86,17 +86,17 @@ func (s *SQLProvider) Setup(ctx context.Context) error {
 	return nil
 }
 
-func (s *SQLProvider) Create(ctx context.Context, item utils.Record) error {
+func (s *SQLProvider) Create(ctx context.Context, item Record) error {
 	return s.db.Create(ctx, &item)
 }
 
-func (s *SQLProvider) Read(ctx context.Context, id string) (utils.Record, error) {
+func (s *SQLProvider) Read(ctx context.Context, id string) (Record, error) {
 	return s.db.First(ctx, map[string]any{
 		s.Config.IDColumn: id,
 	})
 }
 
-func (s *SQLProvider) Update(ctx context.Context, item utils.Record) error {
+func (s *SQLProvider) Update(ctx context.Context, item Record) error {
 	id, ok := item[s.Config.IDColumn].(string)
 	if !ok {
 		return fmt.Errorf("item missing id field %s", s.Config.IDColumn)
@@ -112,12 +112,12 @@ func (s *SQLProvider) Delete(ctx context.Context, id string) error {
 	})
 }
 
-func (s *SQLProvider) All(ctx context.Context) ([]utils.Record, error) {
+func (s *SQLProvider) All(ctx context.Context) ([]Record, error) {
 	return s.db.All(ctx)
 }
 
-func (s *SQLProvider) Stream(ctx context.Context) (<-chan utils.Record, <-chan error) {
-	out := make(chan utils.Record)
+func (s *SQLProvider) Stream(ctx context.Context) (<-chan Record, <-chan error) {
+	out := make(chan Record)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(out)
@@ -184,7 +184,7 @@ func (r *RESTProvider) Close() error {
 	return nil
 }
 
-func (r *RESTProvider) Create(ctx context.Context, item utils.Record) error {
+func (r *RESTProvider) Create(ctx context.Context, item Record) error {
 	url := fmt.Sprintf("%s/%s", r.baseURL, r.resourcePath)
 	dataBytes, err := json.Marshal(item)
 	if err != nil {
@@ -208,7 +208,7 @@ func (r *RESTProvider) Create(ctx context.Context, item utils.Record) error {
 	return nil
 }
 
-func (r *RESTProvider) Read(ctx context.Context, id string) (utils.Record, error) {
+func (r *RESTProvider) Read(ctx context.Context, id string) (Record, error) {
 	url := fmt.Sprintf("%s/%s/%s", r.baseURL, r.resourcePath, id)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -228,12 +228,12 @@ func (r *RESTProvider) Read(ctx context.Context, id string) (utils.Record, error
 	if err != nil {
 		return nil, err
 	}
-	var item utils.Record
+	var item Record
 	err = json.Unmarshal(dataBytes, &item)
 	return item, err
 }
 
-func (r *RESTProvider) Update(ctx context.Context, item utils.Record) error {
+func (r *RESTProvider) Update(ctx context.Context, item Record) error {
 	id, ok := item[r.IdField].(string)
 	if !ok {
 		return fmt.Errorf("item missing id field %s", r.IdField)
@@ -280,7 +280,7 @@ func (r *RESTProvider) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-func (r *RESTProvider) All(ctx context.Context) ([]utils.Record, error) {
+func (r *RESTProvider) All(ctx context.Context) ([]Record, error) {
 	url := fmt.Sprintf("%s/%s", r.baseURL, r.resourcePath)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -300,7 +300,7 @@ func (r *RESTProvider) All(ctx context.Context) ([]utils.Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	var items []utils.Record
+	var items []Record
 	if err := json.Unmarshal(dataBytes, &items); err != nil {
 		return nil, err
 	}
@@ -334,10 +334,10 @@ func (p *JSONFileProvider) Setup(_ context.Context) error {
 	return nil
 }
 
-func (p *JSONFileProvider) readAll() ([]utils.Record, error) {
+func (p *JSONFileProvider) readAll() ([]Record, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var items []utils.Record
+	var items []Record
 	if _, err := os.Stat(p.Config.FilePath); os.IsNotExist(err) {
 		return items, nil
 	}
@@ -352,7 +352,7 @@ func (p *JSONFileProvider) readAll() ([]utils.Record, error) {
 	return items, err
 }
 
-func (p *JSONFileProvider) writeAll(items []utils.Record) error {
+func (p *JSONFileProvider) writeAll(items []Record) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	data, err := json.Marshal(items)
@@ -362,7 +362,7 @@ func (p *JSONFileProvider) writeAll(items []utils.Record) error {
 	return os.WriteFile(p.Config.FilePath, data, 0644)
 }
 
-func (p *JSONFileProvider) Create(_ context.Context, item utils.Record) error {
+func (p *JSONFileProvider) Create(_ context.Context, item Record) error {
 	items, err := p.readAll()
 	if err != nil {
 		return err
@@ -380,7 +380,7 @@ func (p *JSONFileProvider) Create(_ context.Context, item utils.Record) error {
 	return p.writeAll(items)
 }
 
-func (p *JSONFileProvider) Read(_ context.Context, id string) (utils.Record, error) {
+func (p *JSONFileProvider) Read(_ context.Context, id string) (Record, error) {
 	items, err := p.readAll()
 	if err != nil {
 		return nil, err
@@ -393,7 +393,7 @@ func (p *JSONFileProvider) Read(_ context.Context, id string) (utils.Record, err
 	return nil, fmt.Errorf("not found")
 }
 
-func (p *JSONFileProvider) Update(_ context.Context, item utils.Record) error {
+func (p *JSONFileProvider) Update(_ context.Context, item Record) error {
 	items, err := p.readAll()
 	if err != nil {
 		return err
@@ -421,7 +421,7 @@ func (p *JSONFileProvider) Delete(_ context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	var newItems []utils.Record
+	var newItems []Record
 	found := false
 	for _, it := range items {
 		if it[p.Config.IDField] == id {
@@ -436,12 +436,12 @@ func (p *JSONFileProvider) Delete(_ context.Context, id string) error {
 	return p.writeAll(newItems)
 }
 
-func (p *JSONFileProvider) All(_ context.Context) ([]utils.Record, error) {
+func (p *JSONFileProvider) All(_ context.Context) ([]Record, error) {
 	return p.readAll()
 }
 
-func (p *JSONFileProvider) Stream(ctx context.Context) (<-chan utils.Record, <-chan error) {
-	out := make(chan utils.Record)
+func (p *JSONFileProvider) Stream(ctx context.Context) (<-chan Record, <-chan error) {
+	out := make(chan Record)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(out)
@@ -500,10 +500,10 @@ func (p *CSVFileProvider) Setup(_ context.Context) error {
 	return nil
 }
 
-func (p *CSVFileProvider) readAll() ([]utils.Record, error) {
+func (p *CSVFileProvider) readAll() ([]Record, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var items []utils.Record
+	var items []Record
 	if _, err := os.Stat(p.Config.FilePath); os.IsNotExist(err) {
 		return items, nil
 	}
@@ -529,7 +529,7 @@ func (p *CSVFileProvider) readAll() ([]utils.Record, error) {
 		if len(record) < 2 {
 			continue
 		}
-		var item utils.Record
+		var item Record
 		if err := json.Unmarshal([]byte(record[1]), &item); err != nil {
 			continue
 		}
@@ -539,7 +539,7 @@ func (p *CSVFileProvider) readAll() ([]utils.Record, error) {
 	return items, nil
 }
 
-func (p *CSVFileProvider) writeAll(items []utils.Record) error {
+func (p *CSVFileProvider) writeAll(items []Record) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	f, err := os.Create(p.Config.FilePath)
@@ -568,7 +568,7 @@ func (p *CSVFileProvider) writeAll(items []utils.Record) error {
 	return nil
 }
 
-func (p *CSVFileProvider) Create(_ context.Context, item utils.Record) error {
+func (p *CSVFileProvider) Create(_ context.Context, item Record) error {
 	items, err := p.readAll()
 	if err != nil {
 		return err
@@ -586,7 +586,7 @@ func (p *CSVFileProvider) Create(_ context.Context, item utils.Record) error {
 	return p.writeAll(items)
 }
 
-func (p *CSVFileProvider) Read(_ context.Context, id string) (utils.Record, error) {
+func (p *CSVFileProvider) Read(_ context.Context, id string) (Record, error) {
 	items, err := p.readAll()
 	if err != nil {
 		return nil, err
@@ -599,7 +599,7 @@ func (p *CSVFileProvider) Read(_ context.Context, id string) (utils.Record, erro
 	return nil, fmt.Errorf("not found")
 }
 
-func (p *CSVFileProvider) Update(_ context.Context, item utils.Record) error {
+func (p *CSVFileProvider) Update(_ context.Context, item Record) error {
 	items, err := p.readAll()
 	if err != nil {
 		return err
@@ -627,7 +627,7 @@ func (p *CSVFileProvider) Delete(_ context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	var newItems []utils.Record
+	var newItems []Record
 	found := false
 	for _, it := range items {
 		if it[p.Config.IDColumn] == id {
@@ -642,12 +642,12 @@ func (p *CSVFileProvider) Delete(_ context.Context, id string) error {
 	return p.writeAll(newItems)
 }
 
-func (p *CSVFileProvider) All(_ context.Context) ([]utils.Record, error) {
+func (p *CSVFileProvider) All(_ context.Context) ([]Record, error) {
 	return p.readAll()
 }
 
-func (p *CSVFileProvider) Stream(ctx context.Context) (<-chan utils.Record, <-chan error) {
-	out := make(chan utils.Record)
+func (p *CSVFileProvider) Stream(ctx context.Context) (<-chan Record, <-chan error) {
+	out := make(chan Record)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(out)
@@ -698,7 +698,7 @@ func (r *RedisProvider) Close() error {
 	return r.Client.Close()
 }
 
-func (r *RedisProvider) Create(ctx context.Context, item utils.Record) error {
+func (r *RedisProvider) Create(ctx context.Context, item Record) error {
 	id, ok := item[r.Config.IDField].(string)
 	if !ok {
 		return fmt.Errorf("item missing id field %s", r.Config.IDField)
@@ -710,17 +710,17 @@ func (r *RedisProvider) Create(ctx context.Context, item utils.Record) error {
 	return r.Client.Set(ctx, id, string(dataBytes), 0).Err()
 }
 
-func (r *RedisProvider) Read(ctx context.Context, id string) (utils.Record, error) {
+func (r *RedisProvider) Read(ctx context.Context, id string) (Record, error) {
 	result, err := r.Client.Get(ctx, id).Result()
 	if err != nil {
 		return nil, err
 	}
-	var item utils.Record
+	var item Record
 	err = json.Unmarshal([]byte(result), &item)
 	return item, err
 }
 
-func (r *RedisProvider) Update(ctx context.Context, item utils.Record) error {
+func (r *RedisProvider) Update(ctx context.Context, item Record) error {
 	return r.Create(ctx, item)
 }
 
@@ -728,9 +728,9 @@ func (r *RedisProvider) Delete(ctx context.Context, id string) error {
 	return r.Client.Del(ctx, id).Err()
 }
 
-func (r *RedisProvider) All(ctx context.Context) ([]utils.Record, error) {
+func (r *RedisProvider) All(ctx context.Context) ([]Record, error) {
 	var cursor uint64
-	var items []utils.Record
+	var items []Record
 	for {
 		keys, nextCursor, err := r.Client.Scan(ctx, cursor, "*", 10).Result()
 		if err != nil {
@@ -741,7 +741,7 @@ func (r *RedisProvider) All(ctx context.Context) ([]utils.Record, error) {
 			if err != nil {
 				continue
 			}
-			var item utils.Record
+			var item Record
 			if err := json.Unmarshal([]byte(result), &item); err != nil {
 				continue
 			}
