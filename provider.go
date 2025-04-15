@@ -52,7 +52,7 @@ type ProviderConfig struct {
 	squealx.Config
 	TableName    string
 	IDColumn     string
-	DataColumn   string
+	DataColumns  []string
 	BaseURL      string
 	Timeout      time.Duration
 	ResourcePath string
@@ -308,8 +308,14 @@ func (r *RESTProvider) All(ctx context.Context) ([]Record, error) {
 }
 
 type JSONFileConfig struct {
+	// FilePath for the data file.
 	FilePath string
-	IDField  string
+	// IDField is the JSON key used to uniquely identify records.
+	IDField string
+	// TombstoneMarker is the marker string to denote an obsolete record.
+	TombstoneMarker string
+	// Newline is the newline character or sequence to be used.
+	Newline string
 }
 
 type JSONFileProvider struct {
@@ -464,9 +470,16 @@ func (p *JSONFileProvider) Stream(ctx context.Context) (<-chan Record, <-chan er
 }
 
 type CSVFileConfig struct {
-	FilePath   string
-	IDColumn   string
-	DataColumn string
+	// FilePath for the CSV file.
+	FilePath string
+	// IDColumn is the header name of the column that acts as primary key.
+	IDColumn string
+	// DataColumns lists the headers for data columns.
+	DataColumns []string
+	// TombstoneMarker is the marker string to denote an obsolete row.
+	TombstoneMarker string
+	// Delimiter is the CSV delimiter (for example, comma).
+	Delimiter rune
 }
 
 type CSVFileProvider struct {
@@ -495,7 +508,11 @@ func (p *CSVFileProvider) Setup(_ context.Context) error {
 		}()
 		writer := csv.NewWriter(f)
 		defer writer.Flush()
-		return writer.Write([]string{p.Config.IDColumn, p.Config.DataColumn})
+		cols := []string{
+			p.Config.IDColumn,
+		}
+		cols = append(cols, p.Config.DataColumns...)
+		return writer.Write(cols)
 	}
 	return nil
 }
@@ -511,9 +528,7 @@ func (p *CSVFileProvider) readAll() ([]Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		_ = f.Close()
-	}()
+	defer f.Close()
 	reader := csv.NewReader(f)
 	records, err := reader.ReadAll()
 	if err != nil {
@@ -522,46 +537,77 @@ func (p *CSVFileProvider) readAll() ([]Record, error) {
 	if len(records) < 1 {
 		return items, nil
 	}
-	for i, record := range records {
-		if i == 0 {
+	header := records[0]
+	for _, record := range records[1:] {
+		// ensure the row matches the header columns
+		if len(record) != len(header) {
 			continue
 		}
-		if len(record) < 2 {
-			continue
+		item := make(Record)
+		for i, key := range header {
+			item[key] = record[i]
 		}
-		var item Record
-		if err := json.Unmarshal([]byte(record[1]), &item); err != nil {
-			continue
-		}
-		item[p.Config.IDColumn] = record[0]
 		items = append(items, item)
 	}
 	return items, nil
 }
 
+func toString(val any) (string, bool) {
+	switch val := val.(type) {
+	case string:
+		return val, true
+	default:
+		return fmt.Sprint(val), true
+	}
+}
+
 func (p *CSVFileProvider) writeAll(items []Record) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Create (or overwrite) the CSV file.
 	f, err := os.Create(p.Config.FilePath)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = f.Close()
-	}()
+	defer f.Close()
+
+	// Create a CSV writer.
 	writer := csv.NewWriter(f)
 	defer writer.Flush()
 
-	if err := writer.Write([]string{p.Config.IDColumn, p.Config.DataColumn}); err != nil {
+	// Build header row: id column + the additional data columns.
+	header := []string{p.Config.IDColumn}
+	header = append(header, p.Config.DataColumns...)
+	if err := writer.Write(header); err != nil {
 		return err
 	}
+
+	// Write each record.
 	for _, item := range items {
-		id, _ := item[p.Config.IDColumn].(string)
-		dataBytes, err := json.Marshal(item)
-		if err != nil {
-			continue
+		// Row has one column per header value.
+		row := make([]string, len(header))
+		// Get the id value.
+		if id, ok := item[p.Config.IDColumn].(string); ok {
+			row[0] = id
+		} else {
+			row[0] = ""
 		}
-		if err := writer.Write([]string{id, string(dataBytes)}); err != nil {
+		// Retrieve the remaining columns using the keys from the configuration.
+		for i, col := range p.Config.DataColumns {
+			val, exists := item[col]
+			if !exists {
+				row[i+1] = ""
+				continue
+			}
+			// Convert the field value to a string.
+			if s, ok := toString(val); ok {
+				row[i+1] = s
+			} else {
+				row[i+1] = fmt.Sprintf("%v", val)
+			}
+		}
+		if err := writer.Write(row); err != nil {
 			return err
 		}
 	}
@@ -775,9 +821,9 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 		return NewJSONFileProvider(jsonCfg), nil
 	case "csv":
 		csvCfg := CSVFileConfig{
-			FilePath:   cfg.FilePath,
-			IDColumn:   cfg.IDColumn,
-			DataColumn: cfg.DataColumn,
+			FilePath:    cfg.FilePath,
+			IDColumn:    cfg.IDColumn,
+			DataColumns: cfg.DataColumns,
 		}
 		return NewCSVFileProvider(csvCfg), nil
 	case "redis":

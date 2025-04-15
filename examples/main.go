@@ -11,13 +11,11 @@ import (
 	"time"
 
 	"github.com/oarkflow/data"
-	"github.com/oarkflow/data/utils"
-	"github.com/oarkflow/squealx"
 )
 
 func populateProvider(ctx context.Context, provider data.Provider, idField string, count int) error {
 	for i := 0; i < count; i++ {
-		item := utils.Record{
+		item := data.Record{
 			idField: fmt.Sprintf("stream_item_%d", i),
 			"name":  fmt.Sprintf("Streaming Item %d", i),
 			"time":  time.Now().Format(time.RFC3339),
@@ -35,7 +33,7 @@ type RESTServerConfig struct {
 }
 
 var (
-	restStore = make(map[string]utils.Record)
+	restStore = make(map[string]data.Record)
 	restMu    sync.RWMutex
 )
 
@@ -46,7 +44,7 @@ func startRESTServerWithConfig(config RESTServerConfig) {
 	http.HandleFunc(resourcePath, func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case "POST":
-			var item utils.Record
+			var item data.Record
 			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -62,7 +60,7 @@ func startRESTServerWithConfig(config RESTServerConfig) {
 			w.WriteHeader(http.StatusCreated)
 		case "GET":
 			restMu.RLock()
-			items := make([]utils.Record, 0, len(restStore))
+			items := make([]data.Record, 0, len(restStore))
 			for _, item := range restStore {
 				items = append(items, item)
 			}
@@ -93,7 +91,7 @@ func startRESTServerWithConfig(config RESTServerConfig) {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(item)
 		case "PUT":
-			var item utils.Record
+			var item data.Record
 			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -146,7 +144,7 @@ func testDataProvider(ctx context.Context, name string, provider data.Provider) 
 		idField = "id"
 	}
 
-	item := utils.Record{
+	item := data.Record{
 		idField: fmt.Sprintf("%s_item", name),
 		"name":  "Test Item",
 		"time":  time.Now().Format(time.RFC3339),
@@ -156,7 +154,6 @@ func testDataProvider(ctx context.Context, name string, provider data.Provider) 
 		log.Printf("[%s] Create error: %v", name, err)
 		return
 	}
-
 	readItem, err := provider.Read(ctx, item[idField].(string))
 	if err != nil {
 		log.Printf("[%s] Read error: %v", name, err)
@@ -198,43 +195,6 @@ func testDataProvider(ctx context.Context, name string, provider data.Provider) 
 func main() {
 	ctx := context.Background()
 
-	restServerConfig := RESTServerConfig{
-		ResourcePath: "items",
-		IDField:      "id",
-	}
-	go startRESTServerWithConfig(restServerConfig)
-	time.Sleep(1 * time.Second)
-
-	sqlConfig := data.ProviderConfig{
-		Type:       "sqlite",
-		TableName:  "items",
-		IDColumn:   "id",
-		DataColumn: "data",
-	}
-	sqlConfig.Database = "data.db"
-	sqlConfig.Driver = "sqlite"
-	sqlProvider, err := data.NewProvider(sqlConfig)
-	if err != nil {
-		log.Fatalf("SQLProvider error: %v", err)
-	}
-	defer func() {
-		_ = sqlProvider.Close()
-	}()
-	testDataProvider(ctx, "SQLProvider", sqlProvider)
-
-	restConfig := data.ProviderConfig{
-		Type:         "rest",
-		BaseURL:      "http://localhost:8081",
-		Timeout:      5 * time.Second,
-		ResourcePath: "items",
-		IDColumn:     "id",
-	}
-	restProvider, err := data.NewProvider(restConfig)
-	if err != nil {
-		log.Fatalf("RESTProvider error: %v", err)
-	}
-	testDataProvider(ctx, "RESTProvider", restProvider)
-
 	jsonConfig := data.ProviderConfig{
 		Type:     "json",
 		FilePath: "data.json",
@@ -250,10 +210,10 @@ func main() {
 	testDataProvider(ctx, "JSONFileProvider", jsonFileProvider)
 
 	csvConfig := data.ProviderConfig{
-		Type:       "csv",
-		FilePath:   "data.csv",
-		IDColumn:   "id",
-		DataColumn: "data",
+		Type:        "csv",
+		FilePath:    "data.csv",
+		IDColumn:    "id",
+		DataColumns: []string{"name", "time"},
 	}
 	csvFileProvider, err := data.NewProvider(csvConfig)
 	if err != nil {
@@ -264,51 +224,4 @@ func main() {
 	}
 	testDataProvider(ctx, "CSVFileProvider", csvFileProvider)
 
-	redisConfig := data.ProviderConfig{
-		Type: "redis",
-		Config: squealx.Config{
-			Host:     "localhost:6379",
-			Password: "",
-			Database: "0",
-		},
-		IDColumn: "id",
-	}
-	redisProvider, err := data.NewProvider(redisConfig)
-	if err != nil {
-		log.Fatalf("RedisProvider error: %v", err)
-	}
-	if err := redisProvider.Setup(ctx); err != nil {
-		log.Printf("RedisProvider Setup error: %v", err)
-	} else {
-		testDataProvider(ctx, "RedisProvider", redisProvider)
-	}
-	_ = redisProvider.Close()
-
-	log.Println("Populating SQLProvider with data for streaming test...")
-	if err := populateProvider(ctx, sqlProvider, sqlConfig.IDColumn, 5); err != nil {
-		log.Printf("Error populating SQLProvider for streaming: %v", err)
-	}
-
-	log.Println("Streaming data from SQLProvider:")
-	if streamer, ok := sqlProvider.(data.StreamingProvider); ok {
-		streamCh, errCh := streamer.Stream(ctx)
-		for {
-			select {
-			case item, ok := <-streamCh:
-				if !ok {
-					streamCh = nil
-				} else {
-					log.Printf("Streamed item: %v", item)
-				}
-			case err, ok := <-errCh:
-				if ok && err != nil {
-					log.Printf("Stream error: %v", err)
-				}
-				errCh = nil
-			}
-			if streamCh == nil && errCh == nil {
-				break
-			}
-		}
-	}
 }
