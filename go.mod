@@ -1,10 +1,10 @@
 module github.com/oarkflow/data
 
-go 1.24.0
+go 1.24.2
 
 require (
 	github.com/oarkflow/json v0.0.24
-	github.com/oarkflow/squealx v0.0.41
+	github.com/oarkflow/squealx v0.0.46
 	github.com/redis/go-redis/v9 v9.7.3
 )
 

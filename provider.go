@@ -58,6 +58,15 @@ type ProviderConfig struct {
 	Timeout     time.Duration
 	FilePath    string
 	KeyPattern  string
+	Queries     Queries
+}
+
+type Queries struct {
+	QueryCreate string
+	QueryRead   string
+	QueryUpdate string
+	QueryDelete string
+	QueryAll    string
 }
 
 type SQLProvider struct {
@@ -84,7 +93,7 @@ func (s *SQLProvider) Close() error {
 }
 
 func (s *SQLProvider) Setup(ctx context.Context) error {
-	return nil
+	return s.db.GetDB().Ping()
 }
 
 func (s *SQLProvider) Fields(ctx context.Context) (map[string]FieldSchema, error) {
@@ -111,32 +120,77 @@ func (s *SQLProvider) Fields(ctx context.Context) (map[string]FieldSchema, error
 }
 
 func (s *SQLProvider) Create(ctx context.Context, item Record) error {
-	return s.db.Create(ctx, &item)
+	if s.Config.Queries.QueryCreate != "" {
+		err := s.db.GetDB().ExecWithReturn(s.Config.Queries.QueryCreate, &item)
+		return squealx.CanError(err, false)
+	}
+	err := s.db.Create(ctx, &item)
+	return squealx.CanError(err, false)
 }
 
 func (s *SQLProvider) Read(ctx context.Context, id string) (Record, error) {
-	return s.db.First(ctx, map[string]any{
+	filter := map[string]any{
 		s.Config.IDColumn: id,
-	})
+	}
+	if s.Config.Queries.QueryRead != "" {
+		records, err := s.db.Raw(ctx, s.Config.Queries.QueryRead, filter)
+		if err != nil {
+			return nil, err
+		}
+		if len(records) == 0 {
+			return nil, fmt.Errorf("not found")
+		}
+		return records[0], nil
+	}
+	return s.db.First(ctx, filter)
 }
 
 func (s *SQLProvider) Update(ctx context.Context, item Record) error {
-	id, ok := item[s.Config.IDColumn].(string)
+	id, ok := item[s.Config.IDColumn]
 	if !ok {
 		return fmt.Errorf("item missing id field %s", s.Config.IDColumn)
 	}
-	return s.db.Update(ctx, &item, map[string]any{
+	filter := map[string]any{
+		s.Config.IDColumn: id,
+	}
+	if s.Config.Queries.QueryUpdate != "" {
+		records, err := s.db.Raw(ctx, s.Config.Queries.QueryUpdate, filter)
+		if err != nil {
+			return err
+		}
+		if len(records) == 0 {
+			return fmt.Errorf("not found")
+		}
+		return nil
+	}
+	err := s.db.Update(ctx, &item, map[string]any{
 		s.Config.IDColumn: id,
 	})
+	return squealx.CanError(err, false)
 }
 
 func (s *SQLProvider) Delete(ctx context.Context, id string) error {
-	return s.db.Delete(ctx, map[string]any{
+	filter := map[string]any{
 		s.Config.IDColumn: id,
-	})
+	}
+	if s.Config.Queries.QueryDelete != "" {
+		records, err := s.db.Raw(ctx, s.Config.Queries.QueryDelete, filter)
+		if err != nil {
+			return err
+		}
+		if len(records) == 0 {
+			return fmt.Errorf("not found")
+		}
+		return nil
+	}
+	err := s.db.Delete(ctx, filter)
+	return squealx.CanError(err, false)
 }
 
 func (s *SQLProvider) All(ctx context.Context) ([]Record, error) {
+	if s.Config.Queries.QueryAll != "" {
+		return s.db.Raw(ctx, s.Config.Queries.QueryAll)
+	}
 	return s.db.All(ctx)
 }
 
