@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,7 +40,7 @@ type Provider interface {
 	Create(ctx context.Context, item Record) error
 	Read(ctx context.Context, id string) (Record, error)
 	Update(ctx context.Context, item Record) error
-	Fields(ctx context.Context) (fieldList map[string]FieldSchema, err error)
+	Fields(ctx context.Context) (map[string]FieldSchema, error)
 	Delete(ctx context.Context, id string) error
 	All(ctx context.Context) ([]Record, error)
 	Close() error
@@ -57,8 +60,37 @@ type ProviderConfig struct {
 	DataColumns []string
 	Timeout     time.Duration
 	FilePath    string
+	Host        string
+	Password    string
+	Database    string
 	KeyPattern  string
 	Queries     Queries
+}
+
+func ValidateProviderConfig(cfg *ProviderConfig) error {
+	if cfg.Type == "" {
+		return errors.New("provider type is required")
+	}
+	switch cfg.Type {
+	case "mysql", "postgres", "sqlite":
+		if cfg.TableName == "" || cfg.IDColumn == "" {
+			return fmt.Errorf("table name and id column required for SQL provider")
+		}
+	case "json", "csv":
+		if cfg.FilePath == "" || cfg.IDColumn == "" {
+			return fmt.Errorf("file path and id column are required for file provider")
+		}
+	case "rest":
+
+		if cfg.Endpoints.Read.URL == "" && cfg.Endpoints.Create.URL == "" {
+			return fmt.Errorf("at least one REST endpoint URL must be provided")
+		}
+	case "redis":
+		if cfg.Host == "" || cfg.IDColumn == "" {
+			return fmt.Errorf("redis host and id column are required")
+		}
+	}
+	return nil
 }
 
 type Queries struct {
@@ -75,15 +107,18 @@ type SQLProvider struct {
 }
 
 func NewSQLProvider(config ProviderConfig) (*SQLProvider, error) {
+	if err := ValidateProviderConfig(&config); err != nil {
+		return nil, err
+	}
 	db, err := dbFromConfig(config.Config)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dbFromConfig error: %w", err)
 	}
 	repo := squealx.New[map[string]any](db, config.TableName, config.IDColumn)
 	p := &SQLProvider{db: repo, Config: config}
 
 	if err := p.Setup(context.Background()); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("setup error: %w", err)
 	}
 	return p, nil
 }
@@ -93,14 +128,17 @@ func (s *SQLProvider) Close() error {
 }
 
 func (s *SQLProvider) Setup(ctx context.Context) error {
-	return s.db.GetDB().Ping()
+	if err := s.db.GetDB().Ping(); err != nil {
+		return fmt.Errorf("ping error: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLProvider) Fields(ctx context.Context) (map[string]FieldSchema, error) {
 	fieldList := make(map[string]FieldSchema)
 	fields, err := s.db.GetDB().GetTableFields(s.Config.TableName, s.Config.Database)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("GetTableFields error: %w", err)
 	}
 	for _, field := range fields {
 		schema := FieldSchema{
@@ -108,7 +146,7 @@ func (s *SQLProvider) Fields(ctx context.Context) (map[string]FieldSchema, error
 			DataType:        field.DataType,
 			MaxStringLength: field.Length,
 		}
-		if field.IsNullable == "YES" {
+		if strings.ToUpper(field.IsNullable) == "YES" {
 			schema.IsNullable = true
 		}
 		if field.Key == "PRI" {
@@ -135,7 +173,7 @@ func (s *SQLProvider) Read(ctx context.Context, id string) (Record, error) {
 	if s.Config.Queries.QueryRead != "" {
 		records, err := s.db.Raw(ctx, s.Config.Queries.QueryRead, filter)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("raw query read error: %w", err)
 		}
 		if len(records) == 0 {
 			return nil, fmt.Errorf("not found")
@@ -156,16 +194,14 @@ func (s *SQLProvider) Update(ctx context.Context, item Record) error {
 	if s.Config.Queries.QueryUpdate != "" {
 		records, err := s.db.Raw(ctx, s.Config.Queries.QueryUpdate, filter)
 		if err != nil {
-			return err
+			return fmt.Errorf("raw query update error: %w", err)
 		}
 		if len(records) == 0 {
 			return fmt.Errorf("not found")
 		}
 		return nil
 	}
-	err := s.db.Update(ctx, &item, map[string]any{
-		s.Config.IDColumn: id,
-	})
+	err := s.db.Update(ctx, &item, filter)
 	return squealx.CanError(err, false)
 }
 
@@ -176,7 +212,7 @@ func (s *SQLProvider) Delete(ctx context.Context, id string) error {
 	if s.Config.Queries.QueryDelete != "" {
 		records, err := s.db.Raw(ctx, s.Config.Queries.QueryDelete, filter)
 		if err != nil {
-			return err
+			return fmt.Errorf("raw query delete error: %w", err)
 		}
 		if len(records) == 0 {
 			return fmt.Errorf("not found")
@@ -202,7 +238,7 @@ func (s *SQLProvider) Stream(ctx context.Context) (<-chan Record, <-chan error) 
 		defer close(errCh)
 		items, err := s.All(ctx)
 		if err != nil {
-			errCh <- err
+			errCh <- fmt.Errorf("streaming error: %w", err)
 			return
 		}
 		for _, item := range items {
@@ -242,12 +278,18 @@ type RESTConfig struct {
 type RESTProvider struct {
 	client    *http.Client
 	endpoints EndpointsConfig
+	retries   int
+	backoff   time.Duration
 }
 
 func NewRESTProvider(config RESTConfig) *RESTProvider {
 	return &RESTProvider{
-		client:    &http.Client{Timeout: config.Timeout},
+		client: &http.Client{
+			Timeout: config.Timeout,
+		},
 		endpoints: config.Endpoints,
+		retries:   3,
+		backoff:   500 * time.Millisecond,
 	}
 }
 
@@ -255,6 +297,23 @@ func applyHeaders(req *http.Request, headers map[string]string) {
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
+}
+
+func doWithRetry(ctx context.Context, attempts int, delay time.Duration, operation func() error) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		err = operation()
+		if err == nil {
+			return nil
+		}
+		log.Printf("operation failed (attempt %d/%d): %v", i+1, attempts, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay * time.Duration(1<<i)):
+		}
+	}
+	return fmt.Errorf("operation failed after %d attempts: %w", attempts, err)
 }
 
 func (r *RESTProvider) Setup(ctx context.Context) error {
@@ -268,23 +327,27 @@ func (r *RESTProvider) Create(ctx context.Context, item Record) error {
 	}
 	dataBytes, err := json.Marshal(item)
 	if err != nil {
-		return err
+		return fmt.Errorf("json marshal error: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, ep.Method, ep.URL, bytes.NewBuffer(dataBytes))
-	if err != nil {
-		return err
+	op := func() error {
+		req, err := http.NewRequestWithContext(ctx, ep.Method, ep.URL, bytes.NewBuffer(dataBytes))
+		if err != nil {
+			return fmt.Errorf("new request error: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		applyHeaders(req, ep.Headers)
+		resp, err := r.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("http do error: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to create item, status: %s, body: %s", resp.Status, string(bodyBytes))
+		}
+		return nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-	applyHeaders(req, ep.Headers)
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("failed to create item, status: %s", resp.Status)
-	}
-	return nil
+	return doWithRetry(ctx, r.retries, r.backoff, op)
 }
 
 func (r *RESTProvider) Read(ctx context.Context, id string) (Record, error) {
@@ -292,59 +355,73 @@ func (r *RESTProvider) Read(ctx context.Context, id string) (Record, error) {
 	if ep.Method == "" {
 		ep.Method = "GET"
 	}
-	url := fmt.Sprintf(ep.URL, id)
-	req, err := http.NewRequestWithContext(ctx, ep.Method, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	applyHeaders(req, ep.Headers)
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to read item, status: %s", resp.Status)
-	}
-	dataBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	isArray, err := CheckJSON(dataBytes)
-	if err != nil {
-		return nil, err
-	}
-	if isArray {
-		var items []Record
-		err = json.Unmarshal(dataBytes, &items)
+
+	encodedID := url.QueryEscape(id)
+	readURL := fmt.Sprintf(ep.URL, encodedID)
+	var result Record
+	op := func() error {
+		req, err := http.NewRequestWithContext(ctx, ep.Method, readURL, nil)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("new request error: %w", err)
 		}
-		if len(items) > 0 {
-			return items[0], nil
+		applyHeaders(req, ep.Headers)
+		resp, err := r.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("http do error: %w", err)
 		}
-		for _, item := range items {
-			if item[r.endpoints.Read.IDField] == id {
-				return item, nil
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to read item, status: %s, body: %s", resp.Status, string(bodyBytes))
+		}
+		dataBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("read body error: %w", err)
+		}
+		isArray, err := CheckJSON(dataBytes)
+		if err != nil {
+			return fmt.Errorf("check json error: %w", err)
+		}
+		if isArray {
+			var items []Record
+			if err := json.Unmarshal(dataBytes, &items); err != nil {
+				return fmt.Errorf("json unmarshal array error: %w", err)
+			}
+			if len(items) > 0 {
+				result = items[0]
+				return nil
+			}
+			for _, item := range items {
+				if item[ep.IDField] == id {
+					result = item
+					return nil
+				}
+			}
+			return fmt.Errorf("item not found")
+		}
+		if ep.DataKey != "" {
+			dataBytes, _, _, err = jsonparser.Get(dataBytes, ep.DataKey)
+			if err != nil {
+				return fmt.Errorf("jsonparser error: %w", err)
 			}
 		}
-		return nil, fmt.Errorf("item not found")
-	}
-	if r.endpoints.Read.DataKey != "" {
-		dataBytes, _, _, err = jsonparser.Get(dataBytes, r.endpoints.Read.DataKey)
-		if err != nil {
-			return nil, err
+		var item Record
+		if err := json.Unmarshal(dataBytes, &item); err != nil {
+			return fmt.Errorf("json unmarshal error: %w", err)
 		}
+		result = item
+		return nil
 	}
-	var item Record
-	err = json.Unmarshal(dataBytes, &item)
-	return item, err
+	if err := doWithRetry(ctx, r.retries, r.backoff, op); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (r *RESTProvider) Fields(ctx context.Context) (map[string]FieldSchema, error) {
 	records, err := r.All(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("all records error: %w", err)
 	}
 	return DetectSchema(records, 10), nil
 }
@@ -356,24 +433,34 @@ func (r *RESTProvider) Update(ctx context.Context, item Record) error {
 	}
 	dataBytes, err := json.Marshal(item)
 	if err != nil {
-		return err
+		return fmt.Errorf("json marshal error: %w", err)
 	}
-	url := fmt.Sprintf(ep.URL, item[ep.IDField])
-	req, err := http.NewRequestWithContext(ctx, ep.Method, url, bytes.NewBuffer(dataBytes))
-	if err != nil {
-		return err
+
+	id, ok := item[ep.IDField].(string)
+	if !ok {
+		return fmt.Errorf("item missing id field %s", ep.IDField)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	applyHeaders(req, ep.Headers)
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return err
+	encodedID := url.QueryEscape(id)
+	updateURL := fmt.Sprintf(ep.URL, encodedID)
+	op := func() error {
+		req, err := http.NewRequestWithContext(ctx, ep.Method, updateURL, bytes.NewBuffer(dataBytes))
+		if err != nil {
+			return fmt.Errorf("new request error: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		applyHeaders(req, ep.Headers)
+		resp, err := r.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("http do error: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to update item, status: %s, body: %s", resp.Status, string(bodyBytes))
+		}
+		return nil
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to update item, status: %s", resp.Status)
-	}
-	return nil
+	return doWithRetry(ctx, r.retries, r.backoff, op)
 }
 
 func (r *RESTProvider) Delete(ctx context.Context, id string) error {
@@ -381,21 +468,26 @@ func (r *RESTProvider) Delete(ctx context.Context, id string) error {
 	if ep.Method == "" {
 		ep.Method = "DELETE"
 	}
-	url := fmt.Sprintf(ep.URL, id)
-	req, err := http.NewRequestWithContext(ctx, ep.Method, url, nil)
-	if err != nil {
-		return err
+	encodedID := url.QueryEscape(id)
+	deleteURL := fmt.Sprintf(ep.URL, encodedID)
+	op := func() error {
+		req, err := http.NewRequestWithContext(ctx, ep.Method, deleteURL, nil)
+		if err != nil {
+			return fmt.Errorf("new request error: %w", err)
+		}
+		applyHeaders(req, ep.Headers)
+		resp, err := r.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("http do error: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to delete item, status: %s, body: %s", resp.Status, string(bodyBytes))
+		}
+		return nil
 	}
-	applyHeaders(req, ep.Headers)
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to delete item, status: %s", resp.Status)
-	}
-	return nil
+	return doWithRetry(ctx, r.retries, r.backoff, op)
 }
 
 func (r *RESTProvider) All(ctx context.Context) ([]Record, error) {
@@ -403,41 +495,73 @@ func (r *RESTProvider) All(ctx context.Context) ([]Record, error) {
 	if ep.Method == "" {
 		ep.Method = "GET"
 	}
-	req, err := http.NewRequestWithContext(ctx, ep.Method, ep.URL, nil)
-	if err != nil {
-		return nil, err
-	}
-	applyHeaders(req, ep.Headers)
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to get all items, status: %s", resp.Status)
-	}
-	dataBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	isArray, err := CheckJSON(dataBytes)
-	if err != nil {
-		return nil, err
-	}
-	if !isArray && r.endpoints.All.DataKey != "" {
-		dataBytes, _, _, err = jsonparser.Get(dataBytes, r.endpoints.All.DataKey)
-		if err != nil {
-			return nil, err
-		}
-	}
 	var items []Record
-	err = json.Unmarshal(dataBytes, &items)
+	op := func() error {
+		req, err := http.NewRequestWithContext(ctx, ep.Method, ep.URL, nil)
+		if err != nil {
+			return fmt.Errorf("new request error: %w", err)
+		}
+		applyHeaders(req, ep.Headers)
+		resp, err := r.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("http do error: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("failed to get all items, status: %s, body: %s", resp.Status, string(bodyBytes))
+		}
+		dataBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("read body error: %w", err)
+		}
+		isArray, err := CheckJSON(dataBytes)
+		if err != nil {
+			return fmt.Errorf("check json error: %w", err)
+		}
+		if !isArray && ep.DataKey != "" {
+			dataBytes, _, _, err = jsonparser.Get(dataBytes, ep.DataKey)
+			if err != nil {
+				return fmt.Errorf("jsonparser error: %w", err)
+			}
+		}
+		if err := json.Unmarshal(dataBytes, &items); err != nil {
+			return fmt.Errorf("json unmarshal error: %w", err)
+		}
+		return nil
+	}
+	if err := doWithRetry(ctx, r.retries, r.backoff, op); err != nil {
+		return nil, err
+	}
 	return items, nil
 }
 
 func (r *RESTProvider) Close() error {
 	r.client.CloseIdleConnections()
 	return nil
+}
+
+func (r *RESTProvider) Stream(ctx context.Context) (<-chan Record, <-chan error) {
+	out := make(chan Record)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(out)
+		defer close(errCh)
+		records, err := r.All(ctx)
+		if err != nil {
+			errCh <- fmt.Errorf("stream error: %w", err)
+			return
+		}
+		for _, item := range records {
+			select {
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			case out <- item:
+			}
+		}
+	}()
+	return out, errCh
 }
 
 type FileConfig struct {
@@ -466,7 +590,9 @@ func (p *JSONFileProvider) Setup(_ context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, err := os.Stat(p.Config.FilePath); os.IsNotExist(err) {
-		return os.WriteFile(p.Config.FilePath, []byte("[]"), 0644)
+		if err := os.WriteFile(p.Config.FilePath, []byte("[]"), 0644); err != nil {
+			return fmt.Errorf("write file error: %w", err)
+		}
 	}
 	return nil
 }
@@ -480,13 +606,15 @@ func (p *JSONFileProvider) readAll() ([]Record, error) {
 	}
 	data, err := os.ReadFile(p.Config.FilePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read file error: %w", err)
 	}
 	if len(data) == 0 {
 		return items, nil
 	}
-	err = json.Unmarshal(data, &items)
-	return items, err
+	if err := json.Unmarshal(data, &items); err != nil {
+		return nil, fmt.Errorf("json unmarshal error: %w", err)
+	}
+	return items, nil
 }
 
 func (p *JSONFileProvider) writeAll(items []Record) error {
@@ -494,9 +622,12 @@ func (p *JSONFileProvider) writeAll(items []Record) error {
 	defer p.mu.Unlock()
 	data, err := json.Marshal(items)
 	if err != nil {
-		return err
+		return fmt.Errorf("json marshal error: %w", err)
 	}
-	return os.WriteFile(p.Config.FilePath, data, 0644)
+	if err := os.WriteFile(p.Config.FilePath, data, 0644); err != nil {
+		return fmt.Errorf("write file error: %w", err)
+	}
+	return nil
 }
 
 func (p *JSONFileProvider) Create(_ context.Context, item Record) error {
@@ -573,7 +704,7 @@ func (p *JSONFileProvider) Delete(_ context.Context, id string) error {
 	return p.writeAll(newItems)
 }
 
-func (p *JSONFileProvider) Fields(ctx context.Context) (fieldList map[string]FieldSchema, err error) {
+func (p *JSONFileProvider) Fields(ctx context.Context) (map[string]FieldSchema, error) {
 	records, err := p.All(ctx)
 	if err != nil {
 		return nil, err
@@ -608,6 +739,30 @@ func (p *JSONFileProvider) Stream(ctx context.Context) (<-chan Record, <-chan er
 	return out, errCh
 }
 
+func (p *JSONFileProvider) BulkCreate(_ context.Context, items []Record) error {
+	current, err := p.readAll()
+	if err != nil {
+		return err
+	}
+	existingIDs := make(map[string]bool)
+	for _, it := range current {
+		if id, ok := it[p.Config.IDColumn].(string); ok {
+			existingIDs[id] = true
+		}
+	}
+	for _, item := range items {
+		id, ok := item[p.Config.IDColumn].(string)
+		if !ok {
+			return fmt.Errorf("item missing id field %s", p.Config.IDColumn)
+		}
+		if existingIDs[id] {
+			return fmt.Errorf("item with id %s already exists", id)
+		}
+		current = append(current, item)
+	}
+	return p.writeAll(current)
+}
+
 type CSVFileProvider struct {
 	Config FileConfig
 	mu     sync.Mutex
@@ -627,23 +782,21 @@ func (p *CSVFileProvider) Setup(_ context.Context) error {
 	if _, err := os.Stat(p.Config.FilePath); os.IsNotExist(err) {
 		f, err := os.Create(p.Config.FilePath)
 		if err != nil {
-			return err
+			return fmt.Errorf("create file error: %w", err)
 		}
-		defer func() {
-			_ = f.Close()
-		}()
+		defer f.Close()
 		writer := csv.NewWriter(f)
 		defer writer.Flush()
-		cols := []string{
-			p.Config.IDColumn,
-		}
+		cols := []string{p.Config.IDColumn}
 		cols = append(cols, p.Config.DataColumns...)
-		return writer.Write(cols)
+		if err := writer.Write(cols); err != nil {
+			return fmt.Errorf("write header error: %w", err)
+		}
 	}
 	return nil
 }
 
-func (p *CSVFileProvider) Fields(ctx context.Context) (fieldList map[string]FieldSchema, err error) {
+func (p *CSVFileProvider) Fields(ctx context.Context) (map[string]FieldSchema, error) {
 	records, err := p.All(ctx)
 	if err != nil {
 		return nil, err
@@ -660,13 +813,13 @@ func (p *CSVFileProvider) readAll() ([]Record, error) {
 	}
 	f, err := os.Open(p.Config.FilePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open file error: %w", err)
 	}
 	defer f.Close()
 	reader := csv.NewReader(f)
 	records, err := reader.ReadAll()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read csv error: %w", err)
 	}
 	if len(records) < 1 {
 		return items, nil
@@ -686,11 +839,11 @@ func (p *CSVFileProvider) readAll() ([]Record, error) {
 }
 
 func toString(val any) (string, bool) {
-	switch val := val.(type) {
+	switch v := val.(type) {
 	case string:
-		return val, true
+		return v, true
 	default:
-		return fmt.Sprint(val), true
+		return fmt.Sprint(v), true
 	}
 }
 
@@ -699,7 +852,7 @@ func (p *CSVFileProvider) writeAll(items []Record) error {
 	defer p.mu.Unlock()
 	f, err := os.Create(p.Config.FilePath)
 	if err != nil {
-		return err
+		return fmt.Errorf("create file error: %w", err)
 	}
 	defer f.Close()
 	writer := csv.NewWriter(f)
@@ -707,7 +860,7 @@ func (p *CSVFileProvider) writeAll(items []Record) error {
 	header := []string{p.Config.IDColumn}
 	header = append(header, p.Config.DataColumns...)
 	if err := writer.Write(header); err != nil {
-		return err
+		return fmt.Errorf("write header error: %w", err)
 	}
 	for _, item := range items {
 		row := make([]string, len(header))
@@ -729,7 +882,7 @@ func (p *CSVFileProvider) writeAll(items []Record) error {
 			}
 		}
 		if err := writer.Write(row); err != nil {
-			return err
+			return fmt.Errorf("write row error: %w", err)
 		}
 	}
 	return nil
@@ -851,10 +1004,19 @@ type RedisConfig struct {
 	IDField     string
 	StorageType RedisStorageType
 
-	HashKey string
-	ListKey string
-
+	HashKey    string
+	ListKey    string
 	KeyPattern string
+}
+
+func ValidateRedisConfig(cfg *RedisConfig) error {
+	if cfg.Addr == "" {
+		return fmt.Errorf("redis address required")
+	}
+	if cfg.IDField == "" {
+		return fmt.Errorf("id field required for redis")
+	}
+	return nil
 }
 
 type RedisProvider struct {
@@ -862,17 +1024,23 @@ type RedisProvider struct {
 	Config RedisConfig
 }
 
-func NewRedisProvider(config RedisConfig) *RedisProvider {
+func NewRedisProvider(config RedisConfig) (*RedisProvider, error) {
+	if err := ValidateRedisConfig(&config); err != nil {
+		return nil, err
+	}
 	client := redis.NewClient(&redis.Options{
 		Addr:     config.Addr,
 		Password: config.Password,
 		DB:       config.DB,
 	})
-	return &RedisProvider{Client: client, Config: config}
+	return &RedisProvider{Client: client, Config: config}, nil
 }
 
 func (r *RedisProvider) Setup(ctx context.Context) error {
-	return r.Client.Ping(ctx).Err()
+	if err := r.Client.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("redis ping error: %w", err)
+	}
+	return nil
 }
 
 func (r *RedisProvider) Close() error {
@@ -886,7 +1054,7 @@ func (r *RedisProvider) Create(ctx context.Context, item Record) error {
 	}
 	dataBytes, err := json.Marshal(item)
 	if err != nil {
-		return err
+		return fmt.Errorf("json marshal error: %w", err)
 	}
 	switch r.Config.StorageType {
 	case RedisStorageHash:
@@ -939,11 +1107,13 @@ func (r *RedisProvider) Read(ctx context.Context, id string) (Record, error) {
 		result, err = r.Client.Get(ctx, id).Result()
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("redis get error: %w", err)
 	}
 	var item Record
-	err = json.Unmarshal([]byte(result), &item)
-	return item, err
+	if err := json.Unmarshal([]byte(result), &item); err != nil {
+		return nil, fmt.Errorf("json unmarshal error: %w", err)
+	}
+	return item, nil
 }
 
 func (r *RedisProvider) Update(ctx context.Context, item Record) error {
@@ -1070,6 +1240,29 @@ func (r *RedisProvider) Fields(ctx context.Context) (map[string]FieldSchema, err
 	return DetectSchema(records, 10), nil
 }
 
+func (r *RedisProvider) Stream(ctx context.Context) (<-chan Record, <-chan error) {
+	out := make(chan Record)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(out)
+		defer close(errCh)
+		records, err := r.All(ctx)
+		if err != nil {
+			errCh <- fmt.Errorf("stream error: %w", err)
+			return
+		}
+		for _, item := range records {
+			select {
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			case out <- item:
+			}
+		}
+	}()
+	return out, errCh
+}
+
 func NewProvider(cfg ProviderConfig) (Provider, error) {
 	switch cfg.Type {
 	case "mysql", "postgres", "sqlite":
@@ -1094,16 +1287,18 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 		}
 		return NewCSVFileProvider(csvCfg), nil
 	case "redis":
-		redisCfg := RedisConfig{
-			Password: cfg.Password,
-			IDField:  cfg.IDColumn,
-		}
-		redisCfg.Addr = cfg.Host
 		db, _ := strconv.Atoi(cfg.Database)
-		redisCfg.DB = db
-		return NewRedisProvider(redisCfg), nil
+		redisCfg := RedisConfig{
+			Password:    cfg.Password,
+			IDField:     cfg.IDColumn,
+			Addr:        cfg.Host,
+			DB:          db,
+			KeyPattern:  cfg.KeyPattern,
+			StorageType: RedisStorageKey,
+		}
+		return NewRedisProvider(redisCfg)
 	default:
-		return nil, fmt.Errorf("unsupported providers type: %s", cfg.Type)
+		return nil, fmt.Errorf("unsupported provider type: %s", cfg.Type)
 	}
 }
 
