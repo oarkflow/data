@@ -2,129 +2,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/oarkflow/data"
 )
-
-func populateProvider(ctx context.Context, provider data.Provider, idField string, count int) error {
-	for i := 0; i < count; i++ {
-		item := data.Record{
-			idField: fmt.Sprintf("stream_item_%d", i),
-			"name":  fmt.Sprintf("Streaming Item %d", i),
-			"time":  time.Now().Format(time.RFC3339),
-		}
-		if err := provider.Create(ctx, item); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-type RESTServerConfig struct {
-	ResourcePath string
-	IDField      string
-}
-
-var (
-	restStore = make(map[string]data.Record)
-	restMu    sync.RWMutex
-)
-
-func startRESTServerWithConfig(config RESTServerConfig) {
-	resourcePath := "/" + strings.Trim(config.ResourcePath, "/")
-	idField := config.IDField
-
-	http.HandleFunc(resourcePath, func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case "POST":
-			var item data.Record
-			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			id, ok := item[idField].(string)
-			if !ok {
-				http.Error(w, fmt.Sprintf("missing id field %s", idField), http.StatusBadRequest)
-				return
-			}
-			restMu.Lock()
-			restStore[id] = item
-			restMu.Unlock()
-			w.WriteHeader(http.StatusCreated)
-		case "GET":
-			restMu.RLock()
-			items := make([]data.Record, 0, len(restStore))
-			for _, item := range restStore {
-				items = append(items, item)
-			}
-			restMu.RUnlock()
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(items)
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-
-	http.HandleFunc(resourcePath+"/", func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(r.URL.Path, "/")
-		if len(parts) < 3 {
-			http.Error(w, "invalid URL", http.StatusBadRequest)
-			return
-		}
-		id := parts[2]
-		switch r.Method {
-		case "GET":
-			restMu.RLock()
-			item, ok := restStore[id]
-			restMu.RUnlock()
-			if !ok {
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(item)
-		case "PUT":
-			var item data.Record
-			if err := json.NewDecoder(r.Body).Decode(&item); err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			restMu.Lock()
-			if _, ok := restStore[id]; !ok {
-				restMu.Unlock()
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			restStore[id] = item
-			restMu.Unlock()
-			w.WriteHeader(http.StatusOK)
-		case "DELETE":
-			restMu.Lock()
-			if _, ok := restStore[id]; !ok {
-				restMu.Unlock()
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			delete(restStore, id)
-			restMu.Unlock()
-			w.WriteHeader(http.StatusOK)
-		default:
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-
-	log.Printf("Starting REST server on :8081 with resourcePath %s and idField %s", resourcePath, idField)
-	go func() {
-		_ = http.ListenAndServe(":8081", nil)
-	}()
-}
 
 func testDataProvider(ctx context.Context, name string, provider data.Provider) {
 	log.Printf("Testing %s", name)
@@ -132,8 +15,6 @@ func testDataProvider(ctx context.Context, name string, provider data.Provider) 
 	switch p := provider.(type) {
 	case *data.SQLProvider:
 		idField = p.Config.IDColumn
-	case *data.RESTProvider:
-		idField = p.IdField
 	case *data.JSONFileProvider:
 		idField = p.Config.IDField
 	case *data.CSVFileProvider:
@@ -195,6 +76,77 @@ func testDataProvider(ctx context.Context, name string, provider data.Provider) 
 func main() {
 	ctx := context.Background()
 
+	restConfig := data.ProviderConfig{
+		Type:    "rest",
+		Timeout: 5 * time.Second,
+		Endpoints: data.EndpointsConfig{
+			Create: data.EndpointConfig{
+				URL:     "https://jsonplaceholder.typicode.com/posts",
+				Method:  "POST",
+				IDField: "id",
+			},
+			Read: data.EndpointConfig{
+				URL:     "https://jsonplaceholder.typicode.com/posts/%v",
+				Method:  "GET",
+				IDField: "id",
+			},
+			Update: data.EndpointConfig{
+				URL:     "https://jsonplaceholder.typicode.com/posts/%v",
+				Method:  "PUT",
+				IDField: "id",
+			},
+			Delete: data.EndpointConfig{
+				URL:     "https://jsonplaceholder.typicode.com/posts/%v",
+				Method:  "DELETE",
+				IDField: "id",
+			},
+			All: data.EndpointConfig{
+				URL:    "https://jsonplaceholder.typicode.com/posts",
+				Method: "GET",
+			},
+		},
+		IDColumn: "id",
+	}
+	restProvider, err := data.NewProvider(restConfig)
+	if err != nil {
+		log.Fatalf("RESTProvider error: %v", err)
+	}
+	fmt.Println(restProvider.All(ctx))
+	sqlConfig := data.ProviderConfig{
+		Type:      "sqlite",
+		TableName: "items",
+		IDColumn:  "id",
+	}
+	sqlConfig.Database = "data.db"
+	sqlConfig.Driver = "sqlite"
+	sqlProvider, err := data.NewProvider(sqlConfig)
+	if err != nil {
+		log.Fatalf("SQLProvider error: %v", err)
+	}
+	defer func() {
+		_ = sqlProvider.Close()
+	}()
+	/*// Create the SQLite table if it does not exist.
+	// We assume that the underlying SQL connection can be accessed from the SQLProvider.
+	if sp, ok := sqlProvider.(*data.SQLProvider); ok {
+		// Construct a CREATE TABLE statement using the table and id column from configuration.
+		createTableStmt := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			%s TEXT PRIMARY KEY,
+			name TEXT,
+			time TEXT
+		);`, sp.Config.TableName, sp.Config.IDColumn)
+
+		// Execute the statement on the underlying database connection.
+		// Here we assume that sp.DB is a *sql.DB.
+		if _, err := sp.Exec(ctx, createTableStmt); err != nil {
+			log.Fatalf("Failed to create SQLite table: %v", err)
+		} else {
+			log.Printf("SQLite table %s ensured.", sp.Config.TableName)
+		}
+	} else {
+		log.Printf("SQLProvider is not of expected type; skipping table creation.")
+	}*/
+	testDataProvider(ctx, "SQLProvider", sqlProvider)
 	jsonConfig := data.ProviderConfig{
 		Type:     "json",
 		FilePath: "data.json",
@@ -223,5 +175,27 @@ func main() {
 		log.Fatalf("CSVFileProvider Setup error: %v", err)
 	}
 	testDataProvider(ctx, "CSVFileProvider", csvFileProvider)
+
+	redisConfig := data.ProviderConfig{
+		Type:       "redis",
+		IDColumn:   "id", // the record field that will act as a unique identifier
+		KeyPattern: "*",
+	}
+	redisConfig.Host = "localhost:6379"
+	redisConfig.Password = ""
+	redisConfig.Database = "0"
+
+	redisProvider, err := data.NewProvider(redisConfig)
+	if err != nil {
+		log.Fatalf("RedisProvider error: %v", err)
+	}
+	// Ensure connection is alive.
+	if err := redisProvider.Setup(ctx); err != nil {
+		log.Fatalf("RedisProvider Setup error: %v", err)
+	}
+	defer func() {
+		_ = redisProvider.Close()
+	}()
+	testDataProvider(ctx, "RedisProvider", redisProvider)
 
 }
